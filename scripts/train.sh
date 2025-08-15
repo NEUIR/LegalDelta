@@ -1,0 +1,1 @@
+nohup python ../src/train.py > GRPO_training.log 2>&1 &
