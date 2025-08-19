@@ -49,14 +49,11 @@ git clone https://huggingface.co/Xubqpanda/LegalDelta;
 **(2) Evaluating**
 For different tasks, you need to use different metrics for evaluating.
 
-```
-for Lawbench, please:
-bash scripts/eval_lawbench.sh
-```
+- for Lawbench, please visit [here](https://github.com/open-compass/LawBench)
 
-for Lexeval, please visit [here](https://github.com/CSHaitao/LexEval)
+- for Lexeval, please visit [here](https://github.com/CSHaitao/LexEval)
 
-for Disclaw, please visit [here](https://github.com/FudanDISC/DISC-LawLLM)
+- for Disclaw, please visit [here](https://github.com/FudanDISC/DISC-LawLLM)
 
 
 
