@@ -1,16 +1,15 @@
 """
-2025.8.4
-2025.8.5
+2025.3.2
+2025.3.4
 4.55.2
-0.21.0
+0.15.2
 __UNSLOTH_VERSIONING__
 """
 from torch import Tensor
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, empty_cache, generate_model_card, get_comet_experiment_url, is_wandb_available, nn, os, prepare_deepspeed, random, textwrap, torch, unwrap_model_for_generation, wandb)
+from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedModelWrapper, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, deepcopy, disable_dropout_in_model, empty_cache, generate_model_card, get_comet_experiment_url, is_wandb_available, nn, os, random, textwrap, torch, unwrap_model_for_generation)
 
 
 import os
@@ -21,8 +20,6 @@ import torch
 import numpy as np
 from contextlib import nullcontext
 from torch.nn import functional as F
-from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling as TransformersDataCollatorForLanguageModeling
-
 torch_compile_options = {
     "epilogue_fusion"   : True,
     "max_autotune"      : False,
@@ -32,30 +29,19 @@ torch_compile_options = {
 }
 
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def chunked_selective_log_softmax(logits, index):
-    # Split into 4 chunks only
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
-    all_per_token_logps = []
-    # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
-    for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
-        chunk_logits = chunk_logits.to(torch.float32)
-        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
-        per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
-    pass
-    all_per_token_logps = torch.concat(all_per_token_logps)
-    all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
-    return all_per_token_logps
+def selective_log_softmax(logits, index):
+    logits = logits.to(torch.float32)
+    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+    # loop to reduce peak mem consumption
+    # logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+    logsumexp_values = torch.logsumexp(logits, dim = -1)
+    per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    return per_token_logps
 @dataclass
 class UnslothGKDConfig(GKDConfig):
     """
     
     Configuration class for [`GKDTrainer`].
-
-    This class includes only the parameters that are specific to GKD training. For a full list of training arguments,
-    please refer to the [`~transformers.TrainingArguments`] and [`SFTConfig`] documentation.
 
     Args:
         temperature (`float`, *optional*, defaults to `0.9`):
@@ -69,16 +55,16 @@ class UnslothGKDConfig(GKDConfig):
         max_new_tokens (`int`, *optional*, defaults to `128`):
             Maximum number of tokens to generate per completion.
         teacher_model_name_or_path (`str` or `None`, *optional*, defaults to `None`):
-            Model name or path of the teacher model. If `None`, the teacher model will be the same as the model being
-            trained.
+            Model name or path of the teacher model. If `None`, the teacher model will be the same as the model
+            being trained.
         teacher_model_init_kwargs (`dict[str, Any]]` or `None`, *optional*, defaults to `None`):
             Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the teacher model
             from a string.
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model.
         seq_kd (`bool`, *optional*, defaults to `False`):
-            Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised FT on
-            teacher-generated output).
+            Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised FT
+            on teacher-generated output).
     
     """
     vllm_sampling_params: Optional[Any] = field(
@@ -201,7 +187,7 @@ class UnslothGKDConfig(GKDConfig):
         push_to_hub_organization = None,
         push_to_hub_token = None,
         mp_parameters = '',
-        auto_find_batch_size = True,
+        auto_find_batch_size = False,
         full_determinism = False,
         torchdynamo = None,
         ray_scope = 'last',
@@ -220,21 +206,16 @@ class UnslothGKDConfig(GKDConfig):
         eval_use_gather_object = False,
         average_tokens_across_devices = True,
         model_init_kwargs = None,
-        chat_template_path = None,
+        use_liger = False,
         dataset_text_field = 'text',
         dataset_kwargs = None,
         dataset_num_proc = None,
-        eos_token = None,
-        pad_token = None,
-        max_length = 1024,
+        max_seq_length = 1024,
         packing = False,
-        packing_strategy = 'bfd',
-        padding_free = False,
-        pad_to_multiple_of = None,
         eval_packing = None,
-        completion_only_loss = None,
-        assistant_only_loss = False,
-        activation_offloading = False,
+        dataset_batch_size = None,
+        num_of_sequences = None,
+        chars_per_token = None,
         temperature = 0.9,
         lmbda = 0.5,
         beta = 0.5,
@@ -254,12 +235,7 @@ class UnslothGKDConfig(GKDConfig):
             save_strategy = 'no'
         if dataset_num_proc is None:
             from multiprocessing import cpu_count
-            dataset_num_proc = min(cpu_count()*2, 2)
-        if temperature <= 0:
-            raise MathError('Unsloth: Please set a positive non-zero temperature since your results will be wrong.')
-        elif temperature >= 10:
-            raise MathError('Unsloth: Please set a positive non-zero temperature less than 10, since sampling will be quite erratic.')
-        
+            dataset_num_proc = cpu_count()
         
         super().__init__(
             output_dir = output_dir,
@@ -391,21 +367,16 @@ class UnslothGKDConfig(GKDConfig):
             eval_use_gather_object = eval_use_gather_object,
             average_tokens_across_devices = average_tokens_across_devices,
             model_init_kwargs = model_init_kwargs,
-            chat_template_path = chat_template_path,
+            use_liger = use_liger,
             dataset_text_field = dataset_text_field,
             dataset_kwargs = dataset_kwargs,
             dataset_num_proc = dataset_num_proc,
-            eos_token = eos_token,
-            pad_token = pad_token,
-            max_length = max_length,
+            max_seq_length = max_seq_length,
             packing = packing,
-            packing_strategy = packing_strategy,
-            padding_free = padding_free,
-            pad_to_multiple_of = pad_to_multiple_of,
             eval_packing = eval_packing,
-            completion_only_loss = completion_only_loss,
-            assistant_only_loss = assistant_only_loss,
-            activation_offloading = activation_offloading,
+            dataset_batch_size = dataset_batch_size,
+            num_of_sequences = num_of_sequences,
+            chars_per_token = chars_per_token,
             temperature = temperature,
             lmbda = lmbda,
             beta = beta,
@@ -441,7 +412,7 @@ class _UnslothGKDTrainer(SFTTrainer):
     ):
         # add remove_unused_columns=False to the dataclass args
         args.remove_unused_columns = False
-        data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
+        data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_seq_length)
 
         super().__init__(
             model,
@@ -473,14 +444,17 @@ class _UnslothGKDTrainer(SFTTrainer):
             )
 
         if isinstance(teacher_model, str):
-            teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
+            if args.use_liger:
+                teacher_model = AutoLigerKernelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
+            else:
+                teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
 
         # Disable dropout in the model
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
         if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            self.teacher_model = self._prepare_deepspeed(teacher_model)
         else:
             self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
 
@@ -507,6 +481,14 @@ class _UnslothGKDTrainer(SFTTrainer):
         ):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
 
+    def _prepare_dataset(self, dataset, *args):
+        # SFTTrainer._prepare_dataset() applies the chat template and rename the messages column to text. However, we
+        # need to keep the messages column as it is. We use the following workaround to keep the messages column.
+        dataset = dataset.add_column("_messages", dataset["messages"])
+        dataset = super()._prepare_dataset(dataset, *args)
+        dataset = dataset.rename_column("_messages", "messages")
+        return dataset
+
     @staticmethod
     def generalized_jsd_loss(
         student_logits, teacher_logits, labels=None, beta=0.5, temperature=1.0, reduction="batchmean"
@@ -516,19 +498,12 @@ class _UnslothGKDTrainer(SFTTrainer):
         of https://huggingface.co/papers/2306.13649 for the definition.
 
         Args:
-            student_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            teacher_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            labels:
-                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing
-                loss
-            beta:
-                Interpolation coefficient between 0 and 1 (default: 0.5)
-            temperature:
-                Softmax temperature (default: 1.0)
-            reduction:
-                Specifies the reduction to apply to the output (default: 'batchmean')
+            student_logits: Tensor of shape (batch_size, sequence_length, vocab_size)
+            teacher_logits: Tensor of shape (batch_size, sequence_length, vocab_size)
+            labels: Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing loss
+            beta: Interpolation coefficient between 0 and 1 (default: 0.5)
+            temperature: Softmax temperature (default: 1.0)
+            reduction: Specifies the reduction to apply to the output (default: 'batchmean')
 
         Returns:
             loss: Scalar tensor with the generalized JSD loss
@@ -542,26 +517,21 @@ class _UnslothGKDTrainer(SFTTrainer):
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
-        if beta == 0:
-            jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
-        elif beta == 1:
-            jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
-        else:
-            # Compute the log of the mixture distribution
-            # log(a + b) = log(exp(log(a)) + exp(log(b))) -> for mixture
-            beta = torch.tensor(beta, dtype=student_log_probs.dtype)
-            mixture_log_probs = torch.logsumexp(
-                torch.stack([student_log_probs + torch.log(1 - beta), teacher_log_probs + torch.log(beta)]),
-                dim=0,
-            )
+        # Compute the log of the mixture distribution
+        # log(a + b) = log(exp(log(a)) + exp(log(b))) -> for mixture
+        beta = torch.tensor(beta, dtype=student_log_probs.dtype)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack([student_log_probs + torch.log(beta), teacher_log_probs + torch.log(1 - beta)]),
+            dim=0,
+        )
 
-            # Compute KL divergences using F.kl_div
-            # PyTorch differs from the standard mathematical definition, so the order of the probability distributions is swapped compared to that defined in the paper.
-            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
+        # Compute KL divergences using F.kl_div
+        # PyTorch differs from the standard mathematical definition, so the order of the probability distributions is swapped compared to that defined in the paper.
+        kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
+        kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
 
-            # Compute the Generalized Jensen-Shannon Divergence
-            jsd = beta * kl_teacher + (1 - beta) * kl_student
+        # Compute the Generalized Jensen-Shannon Divergence
+        jsd = beta * kl_teacher + (1 - beta) * kl_student
 
         # Masking
         if labels is not None:
@@ -615,7 +585,7 @@ class _UnslothGKDTrainer(SFTTrainer):
 
     @staticmethod
     def generate_on_policy_outputs(model, inputs, generation_config, pad_token_id=None):
-        # Generate output with respect to the prompt-only
+        # Generate output with respect to the prompt only
         generated_outputs = model.generate(
             input_ids=inputs["prompts"],
             attention_mask=inputs.get("prompt_attention_mask", None),
@@ -642,9 +612,9 @@ class _UnslothGKDTrainer(SFTTrainer):
         """
         Perform a training step for the Generalized Knowledge Distillation (GKD) model.
 
-        This method implements the on-policy learning approach described in the GKD paper. With probability
-        `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
-        the original inputs.
+        This method implements the on-policy learning approach described in the GKD paper.
+        With probability `self.lmbda`, it generates new responses using the student model,
+        which are then used for training instead of the original inputs.
         """
         if self.seq_kd:
             with unwrap_model_for_generation(self.teacher_model, self.accelerator) as unwrapped_model:
@@ -665,6 +635,37 @@ class _UnslothGKDTrainer(SFTTrainer):
 
         loss = super().training_step(model, inputs, num_items_in_batch)
         return loss
+
+    def _prepare_deepspeed(self, model: PreTrainedModelWrapper):
+        # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+
+        if model is not None:
+            if hasattr(model, "config"):
+                hidden_size = (
+                    max(model.config.hidden_sizes)
+                    if getattr(model.config, "hidden_sizes", None)
+                    else getattr(model.config, "hidden_size", None)
+                )
+                if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
+                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
+                    # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+                    config_kwargs.update(
+                        {
+                            "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                            "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                        }
+                    )
+
+        # If ZeRO-3 is used, we shard both the active and reference model.
+        # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
+        if config_kwargs["zero_optimization"]["stage"] != 3:
+            config_kwargs["zero_optimization"]["stage"] = 0
+        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+        model.eval()
+        return model
 
     def create_model_card(
         self,
@@ -691,18 +692,12 @@ class _UnslothGKDTrainer(SFTTrainer):
         else:
             base_model = None
 
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
 
         if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        tags.update(self._tag_names)
+            tags.append("unsloth")
 
         citation = textwrap.dedent("""\
         @inproceedings{agarwal2024on-policy,
@@ -720,7 +715,7 @@ class _UnslothGKDTrainer(SFTTrainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
+            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="GKD",
             trainer_citation=citation,
@@ -751,26 +746,15 @@ class UnslothGKDTrainer(_UnslothGKDTrainer):
     ):
         if args is None: args = UnslothGKDConfig()
         use_bf16 = getattr(args, 'bf16', False)
-        if type(use_bf16) is not bool: use_bf16 = False
         use_fp16 = getattr(args, 'fp16', False)
-        if type(use_fp16) is not bool: use_fp16 = False
-        force_float32 = False
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1':
-            print('Unsloth: Switching to float32 training since model cannot work with float16')
-            force_float32 = True
-        mixed_precision_dtype = os.environ.get('UNSLOTH_MIXED_PRECISION', 'float32')
         dtype = getattr(model.config, 'torch_dtype', None)
         if dtype is None: dtype = model.get_input_embeddings().dtype
         from unsloth_zoo.utils import _get_dtype
         dtype = _get_dtype(dtype)
         float16 = dtype == torch.float16
-        if not force_float32 and (float16 and use_bf16): raise TypeError('Unsloth: Model is in float16 precision but you want to use bfloat16 precision. Set fp16 to `True` and bf16 to `False`')
-        if not force_float32 and (not float16 and use_fp16): raise TypeError('Unsloth: Model is in bfloat16 precision but you want to use float16 precision. Set fp16 to `False` and bf16 to `True`')
-        if force_float32:
-            args.fp16 = False
-            args.bf16 = False
-            os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'
-        elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32':
+        if float16 and use_bf16: raise TypeError('Unsloth: Model is in float16 precision but you want to use bfloat16 precision. Set fp16 to `True` and bf16 to `False`')
+        if not float16 and use_fp16: raise TypeError('Unsloth: Model is in bfloat16 precision but you want to use float16 precision. Set fp16 to `False` and bf16 to `True`')
+        if not use_bf16 and not use_fp16:
             args.fp16 = float16
             args.bf16 = not float16
             os.environ['ACCELERATE_MIXED_PRECISION'] = 'fp16' if float16 else 'bf16'
@@ -788,25 +772,10 @@ class UnslothGKDTrainer(_UnslothGKDTrainer):
             if eval_bsz == 8 and args.per_device_train_batch_size < eval_bsz: args.per_device_eval_batch_size = args.per_device_train_batch_size
             if getattr(args, 'eval_accumulation_steps', None) is None and ga_steps is not None: args.eval_accumulation_steps = ga_steps
         fp16_full_eval = getattr(args, 'fp16_full_eval', False)
-        if type(fp16_full_eval) is not bool: fp16_full_eval = False
         bf16_full_eval = getattr(args, 'bf16_full_eval', False)
-        if type(bf16_full_eval) is not bool: bf16_full_eval = False
         if args.fp16 and bf16_full_eval: args.bf16_full_eval = False; args.fp16_full_eval = True
         if args.bf16 and fp16_full_eval: args.bf16_full_eval = True; args.fp16_full_eval = False
-        if force_float32:
-            args.bf16_full_eval = False
-            args.fp16_full_eval = False
-        elif os.environ.get('UNSLOTH_MIXED_PRECISION', 'float32') == 'bfloat16':
-            args.bf16_full_eval = True
-            args.fp16_full_eval = False
-        elif not bf16_full_eval and not fp16_full_eval:
-            args.bf16_full_eval = args.bf16
-            args.fp16_full_eval = args.fp16
-        _output_logits = False
-        if locals().get('compute_metrics', None) is not None: _output_logits = True
-        if locals().get('preprocess_logits_for_metrics', None) is not None: _output_logits = True
-        if _output_logits:
-            os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
+        if not bf16_full_eval and not fp16_full_eval: args.bf16_full_eval = args.bf16; args.fp16_full_eval = args.fp16
         if 'max_seq_length' not in locals() and not hasattr(args, 'max_seq_length'):
             pass
         else:
@@ -821,23 +790,6 @@ class UnslothGKDTrainer(_UnslothGKDTrainer):
         if 'processing_class' in locals():
             if hasattr(processing_class, 'padding_side'): processing_class.padding_side = 'right'
             if hasattr(processing_class, 'tokenizer') and hasattr(processing_class.tokenizer, 'padding_side'): processing_class.tokenizer.padding_side = 'right'
-        __tokenizer = processing_class if 'processing_class' in locals() else tokenizer
-        from unsloth_zoo.vision_utils import UnslothVisionDataCollator
-        if not isinstance(data_collator, UnslothVisionDataCollator):
-            if isinstance(data_collator, DataCollatorForSeq2Seq) and 'labels' not in train_dataset.column_names:
-                data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer, mlm = False, mlm_probability = 0.0)
-            elif isinstance(data_collator, TransformersDataCollatorForLanguageModeling) and 'labels' in train_dataset.column_names:
-                data_collator = DataCollatorForSeq2Seq(__tokenizer)
-        else:
-            if hasattr(args, 'remove_unused_columns'): args.remove_unused_columns = False
-            if hasattr(args, 'dataset_text_field'): args.dataset_text_field = ''
-            if hasattr(args, 'dataset_kwargs'): args.dataset_kwargs = {'skip_prepare_dataset': True}
-        if not isinstance(data_collator, UnslothVisionDataCollator):
-            if not hasattr(__tokenizer, 'pad') and hasattr(__tokenizer, 'tokenizer'):
-                if isinstance(data_collator, DataCollatorForSeq2Seq):
-                    data_collator = DataCollatorForSeq2Seq(__tokenizer.tokenizer)
-                else:
-                    data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer.tokenizer, mlm = False, mlm_probability = 0.0)
         other_metrics = []
         
         from unsloth_zoo.logging_utils import PatchRLStatistics
@@ -861,14 +813,6 @@ class UnslothGKDTrainer(_UnslothGKDTrainer):
             if hasattr(self, 'neftune_hook_handle'): del self.neftune_hook_handle
         if getattr(args, 'neftune_noise_alpha', None) is not None:
             model.get_input_embeddings().neftune_noise_alpha = self.neftune_noise_alpha
-        pass
-        if hasattr(self, 'accelerator'):
-            scaler = self.accelerator.scaler
-            current_model = model
-            while hasattr(current_model, 'model'):
-                current_model.accelerator_scaler = scaler
-                current_model = current_model.model
-            current_model.accelerator_scaler = scaler
         pass
         
 pass

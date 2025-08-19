@@ -20,7 +20,7 @@ def count_xml(text) -> float:
     if text.count("\n</answer>") == 1:
         count += 0.125
     import re
-    if re.search(r'\[(法条|刑期|罪名|金额|正确答案)\]', text):  # 只搜索[法条]或[刑期]或[罪名]
+    if re.search(r'\[(法条|刑期|罪名|金额|正确答案)\]', text): 
         count += 0.125 
     if text.count("<eoa>") == 1:
         count += 0.125

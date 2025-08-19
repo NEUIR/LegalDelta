@@ -1,16 +1,15 @@
 """
-2025.8.4
-2025.8.5
+2025.3.2
+2025.3.4
 4.55.2
-0.21.0
+0.15.2
 __UNSLOTH_VERSIONING__
 """
 from torch import Tensor
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.cpo_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, CPOConfig, CPOTrainer, Callable, DPODataCollatorWithPadding, DataCollator, DataLoader, Dataset, EvalLoopOutput, F, FeatureExtractionMixin, Literal, Optional, PartialState, Path, PeftModel, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, Trainer, TrainerCallback, Union, add_bos_token_if_needed, add_eos_token_if_needed, autocast, defaultdict, disable_dropout_in_model, generate_model_card, get_comet_experiment_url, inspect, is_comet_available, is_peft_available, is_torch_fx_proxy, is_wandb_available, log_table_to_comet_experiment, maybe_apply_chat_template, maybe_extract_prompt, nn, np, nullcontext, os, pad_to_length, pd, peft_module_casting_to_bf16, prepare_model_for_kbit_training, random, selective_log_softmax, textwrap, torch, wandb, warnings, F, Optional, PeftModel, PreTrainedModel, Trainer, is_peft_available, os, torch)
+from trl.trainer.cpo_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, CPOConfig, CPOTrainer, Callable, DPODataCollatorWithPadding, DataCollator, DataLoader, Dataset, EvalLoopOutput, F, FeatureExtractionMixin, Literal, Optional, PartialState, PeftModel, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, Trainer, TrainerCallback, Union, add_bos_token_if_needed, add_eos_token_if_needed, amp, defaultdict, disable_dropout_in_model, generate_model_card, get_comet_experiment_url, inspect, is_comet_available, is_peft_available, is_torch_fx_proxy, is_wandb_available, log_table_to_comet_experiment, maybe_apply_chat_template, maybe_extract_prompt, nn, np, nullcontext, os, pad_to_length, pd, peft_module_casting_to_bf16, prepare_model_for_kbit_training, random, textwrap, torch, transformers, version, warnings)
 
 
 import os
@@ -21,8 +20,6 @@ import torch
 import numpy as np
 from contextlib import nullcontext
 from torch.nn import functional as F
-from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling as TransformersDataCollatorForLanguageModeling
-
 torch_compile_options = {
     "epilogue_fusion"   : True,
     "max_autotune"      : False,
@@ -32,37 +29,28 @@ torch_compile_options = {
 }
 
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def chunked_selective_log_softmax(logits, index):
-    # Split into 4 chunks only
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
-    all_per_token_logps = []
-    # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
-    for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
-        chunk_logits = chunk_logits.to(torch.float32)
-        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
-        per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
-    pass
-    all_per_token_logps = torch.concat(all_per_token_logps)
-    all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
-    return all_per_token_logps
+def selective_log_softmax(logits, index):
+    logits = logits.to(torch.float32)
+    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+    # loop to reduce peak mem consumption
+    # logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+    logsumexp_values = torch.logsumexp(logits, dim = -1)
+    per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    return per_token_logps
 @dataclass
 class UnslothCPOConfig(CPOConfig):
     """
     
     Configuration class for the [`CPOTrainer`].
 
-    This class includes only the parameters that are specific to CPO training. For a full list of training arguments,
-    please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this class may
-    differ from those in [`~transformers.TrainingArguments`].
-
     Using [`~transformers.HfArgumentParser`] we can turn this class into
     [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
     command line.
 
     Parameters:
+        learning_rate (`float`, *optional*, defaults to `1e-6`):
+            Initial learning rate for [`AdamW`] optimizer. The default value replaces that of
+            [`~transformers.TrainingArguments`].
         max_length (`int` or `None`, *optional*, defaults to `1024`):
             Maximum length of the sequences (prompt + completion) in the batch. This argument is required if you want
             to use the default data collator.
@@ -81,8 +69,7 @@ class UnslothCPOConfig(CPOConfig):
             Type of loss to use. Possible values are:
 
                 - `"sigmoid"`: sigmoid loss from the original [DPO](https://huggingface.co/papers/2305.18290) paper.
-                - `"hinge"`: hinge loss on the normalized likelihood from the
-                  [SLiC](https://huggingface.co/papers/2305.10425) paper.
+                - `"hinge"`: hinge loss on the normalized likelihood from the [SLiC](https://huggingface.co/papers/2305.10425) paper.
                 - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
                 - `"simpo"`: SimPO loss from the [SimPO](https://huggingface.co/papers/2405.14734) paper.
 
@@ -231,7 +218,7 @@ class UnslothCPOConfig(CPOConfig):
         push_to_hub_organization = None,
         push_to_hub_token = None,
         mp_parameters = '',
-        auto_find_batch_size = True,
+        auto_find_batch_size = False,
         full_determinism = False,
         torchdynamo = None,
         ray_scope = 'last',
@@ -276,7 +263,7 @@ class UnslothCPOConfig(CPOConfig):
             save_strategy = 'no'
         if dataset_num_proc is None:
             from multiprocessing import cpu_count
-            dataset_num_proc = min(cpu_count()*2, 2)
+            dataset_num_proc = cpu_count()
         
         super().__init__(
             output_dir = output_dir,
@@ -495,7 +482,7 @@ class _UnslothCPOTrainer(Trainer):
                     prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
 
                 model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
-            elif args.gradient_checkpointing:
+            elif getattr(args, "gradient_checkpointing", False):
                 # For backward compatibility with older versions of transformers
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
@@ -516,7 +503,7 @@ class _UnslothCPOTrainer(Trainer):
         # For models that use gradient_checkpointing, we need to attach a hook that enables input
         # to explicitly have `requires_grad=True`, otherwise training will either silently
         # fail or completely fail.
-        elif args.gradient_checkpointing:
+        elif getattr(args, "gradient_checkpointing", False):
             # For backward compatibility with older versions of transformers
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
@@ -564,11 +551,6 @@ class _UnslothCPOTrainer(Trainer):
             max_prompt_length = 128
         else:
             max_prompt_length = args.max_prompt_length
-
-        if not max_prompt_length < max_length:
-            raise ValueError(
-                f"max_prompt_length ({max_prompt_length}) should be strictly less than max_length ({max_length})."
-            )
 
         if args.max_completion_length is None and self.is_encoder_decoder:
             warnings.warn(
@@ -642,7 +624,7 @@ class _UnslothCPOTrainer(Trainer):
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        # The trainer estimates the number of FLOPs [floating-point operations] using the number of elements in the
+        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in CPO, the sampled data does not include the
         # "input_ids" key. Instead, the available keys are "prompt_input_ids", "chosen_input_ids", and
         # "rejected_input_ids". As a result, the trainer issues the warning: "Could not estimate the number of tokens
@@ -653,7 +635,7 @@ class _UnslothCPOTrainer(Trainer):
 
         # Compute that only on the main process for faster data processing.
         # see: https://github.com/huggingface/trl/pull/1255
-        with PartialState().main_process_first():
+        with PartialState().local_main_process_first():
             # Extract the prompt if needed, and apply the chat template if needed
             train_dataset = train_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
             train_dataset = train_dataset.map(
@@ -702,8 +684,9 @@ class _UnslothCPOTrainer(Trainer):
 
     def build_tokenized_answer(self, prompt, answer):
         """
-        Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`. It does ensure `enc(a + b) = enc(a) + enc(a +
-        b)[len(enc(a)):]`. Reference:
+        Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`.
+        It does ensure `enc(a + b) = enc(a) + enc(a + b)[len(enc(a)):]`.
+        Reference:
             https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
         """
 
@@ -752,12 +735,13 @@ class _UnslothCPOTrainer(Trainer):
     def tokenize_row(self, feature, model: Optional[Union[PreTrainedModel, nn.Module]] = None) -> dict:
         """Tokenize a single row from a CPO specific dataset.
 
-        At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation in case the prompt +
-        chosen or prompt + rejected responses is/are too long. First we truncate the prompt; if we're still too long,
-        we truncate the chosen/rejected.
+        At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
+        in case the prompt + chosen or prompt + rejected responses is/are too long. First
+        we truncate the prompt; if we're still too long, we truncate the chosen/rejected.
 
-        We also create the labels for the chosen/rejected responses, which are of length equal to the sum of the length
-        of the prompt and the chosen/rejected response, with label_pad_token_id for the prompt tokens.
+        We also create the labels for the chosen/rejected responses, which are of length equal to
+        the sum of the length of the prompt and the chosen/rejected response, with
+        label_pad_token_id  for the prompt tokens.
         """
         batch = {}
         prompt = feature["prompt"]
@@ -905,17 +889,11 @@ class _UnslothCPOTrainer(Trainer):
         """Concatenate the chosen and rejected inputs into a single tensor.
 
         Args:
-            batch:
-                A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors
-                of shape (batch_size, sequence_length).
-            is_encoder_decoder:
-                Whether the model is an encoder-decoder model.
-            label_pad_token_id:
-                The label pad token id.
-            padding_value:
-                The padding value to use for the concatenated inputs_ids.
-            device:
-                The device for the concatenated inputs.
+            batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
+            is_encoder_decoder: Whether the model is an encoder-decoder model.
+            label_pad_token_id: The label pad token id.
+            padding_value: The padding value to use for the concatenated inputs_ids.
+            device: The device for the concatenated inputs.
 
         Returns:
             A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
@@ -970,15 +948,13 @@ class _UnslothCPOTrainer(Trainer):
         """Compute the CPO loss for a batch of policy and reference model log probabilities.
 
         Args:
-            policy_chosen_logps:
-                Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-            policy_rejected_logps:
-                Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
+            policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
+            policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
 
         Returns:
-            A tuple of three tensors: (losses, chosen_rewards, rejected_rewards). The losses tensor contains the CPO
-            loss for each example in the batch. The chosen_rewards and rejected_rewards tensors contain the rewards for
-            the chosen and rejected responses, respectively.
+            A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
+            The losses tensor contains the CPO loss for each example in the batch.
+            The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
         logits = (policy_chosen_logps - policy_rejected_logps).to(self.accelerator.device)
 
@@ -1027,18 +1003,13 @@ class _UnslothCPOTrainer(Trainer):
 
         Args:
             logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
-            labels:
-                Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are
-                ignored. Shape: (batch_size, sequence_length)
-            average_log_prob:
-                If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the
-                log probabilities of the (non-masked) tokens.
+            labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
+            average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
             label_pad_token_id: The label pad token id.
             is_encoder_decoder: Whether the model is an encoder-decoder model.
 
         Returns:
-            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the
-            given logits.
+            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
         """
         if logits.shape[:-1] != labels.shape:
             raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
@@ -1175,10 +1146,10 @@ class _UnslothCPOTrainer(Trainer):
             self.accelerator.gather_for_metrics(policy_chosen_logps).detach().mean().item()
         )
         metrics[f"{prefix}logits/rejected"] = (
-            self.accelerator.gather_for_metrics(policy_rejected_logits.detach().mean()).mean().item()
+            self.accelerator.gather_for_metrics(policy_rejected_logits).detach().mean().item()
         )
         metrics[f"{prefix}logits/chosen"] = (
-            self.accelerator.gather_for_metrics(policy_chosen_logits.detach().mean()).mean().item()
+            self.accelerator.gather_for_metrics(policy_chosen_logits).detach().mean().item()
         )
         metrics[f"{prefix}nll_loss"] = self.accelerator.gather_for_metrics(policy_nll_loss).detach().mean().item()
 
@@ -1194,9 +1165,7 @@ class _UnslothCPOTrainer(Trainer):
         return_outputs=False,
         num_items_in_batch=None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
-        compute_loss_context_manager = (
-            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
-        )
+        compute_loss_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
 
         with compute_loss_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
@@ -1212,10 +1181,8 @@ class _UnslothCPOTrainer(Trainer):
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
-        # the torch amp context manager as some hidden states are silently casted to full precision.
-        generate_context_manager = (
-            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
-        )
+        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
+        generate_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
 
         with generate_context_manager:
             policy_output = model.generate(
@@ -1244,9 +1211,7 @@ class _UnslothCPOTrainer(Trainer):
             else:
                 ignore_keys = []
 
-        prediction_context_manager = (
-            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
-        )
+        prediction_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
 
         with torch.no_grad(), prediction_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
@@ -1262,8 +1227,8 @@ class _UnslothCPOTrainer(Trainer):
             "eval_logits/chosen": metrics["eval_logits/chosen"],
             "eval_logits/rejected": metrics["eval_logits/rejected"],
         }
-        logits = [v for k, v in logits_dict.items() if k not in ignore_keys]
-        logits = torch.tensor(logits, device=self.accelerator.device)
+        logits = tuple(v.unsqueeze(dim=0) for k, v in logits_dict.items() if k not in ignore_keys)
+        logits = torch.stack(logits).mean(axis=1).to(self.accelerator.device)
         labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
 
         return (loss.detach(), logits, labels)
@@ -1281,8 +1246,8 @@ class _UnslothCPOTrainer(Trainer):
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
         """
-        Overriding built-in evaluation loop to store metrics for each batch. Prediction/evaluation loop, shared by
-        `Trainer.evaluate()` and `Trainer.predict()`.
+        Overriding built-in evaluation loop to store metrics for each batch.
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
 
         Works both with or without labels.
         """
@@ -1338,7 +1303,11 @@ class _UnslothCPOTrainer(Trainer):
         for key, metrics in self._stored_metrics[train_eval].items():
             logs[key] = torch.tensor(metrics).mean().item()
         del self._stored_metrics[train_eval]
-        return super().log(logs, start_time)
+
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            return super().log(logs, start_time)
+        else:  # transformers<=4.46
+            return super().log(logs)
 
     def _shift_right(self, input_ids):
         if self.decoder_start_token_id is None:
@@ -1362,15 +1331,6 @@ class _UnslothCPOTrainer(Trainer):
         shifted_input_ids.masked_fill_(shifted_input_ids == -100, self.pad_token_id)
 
         return shifted_input_ids
-
-    # Ensure the model card is saved along with the checkpoint
-    def _save_checkpoint(self, model, trial):
-        if self.args.hub_model_id is None:
-            model_name = Path(self.args.output_dir).name
-        else:
-            model_name = self.args.hub_model_id.split("/")[-1]
-        self.create_model_card(model_name=model_name)
-        super()._save_checkpoint(model, trial)
 
     def create_model_card(
         self,
@@ -1397,18 +1357,12 @@ class _UnslothCPOTrainer(Trainer):
         else:
             base_model = None
 
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
 
         if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        tags.update(self._tag_names)
+            tags.append("unsloth")
 
         citation = textwrap.dedent("""\
         @inproceedings{xu2024contrastive,
@@ -1426,7 +1380,7 @@ class _UnslothCPOTrainer(Trainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
+            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="CPO",
             trainer_citation=citation,
@@ -1445,20 +1399,18 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
         args (`CPOConfig`):
             The CPO config arguments to use for training.
         data_collator (`transformers.DataCollator`):
-            The data collator to use for training. If None is specified, the default data collator
-            (`DPODataCollatorWithPadding`) will be used which will pad the sequences to the maximum length of the
-            sequences in the batch, given a dataset of paired sequences.
+            The data collator to use for training. If None is specified, the default data collator (`DPODataCollatorWithPadding`) will be used
+            which will pad the sequences to the maximum length of the sequences in the batch, given a dataset of paired sequences.
         train_dataset (`datasets.Dataset`):
             The dataset to use for training.
         eval_dataset (`datasets.Dataset`):
             The dataset to use for evaluation.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*, defaults to `None`):
+        processing_class (`PreTrainedTokenizerBase` or `BaseImageProcessor` or `FeatureExtractionMixin` or `ProcessorMixin`, *optional*):
             Processing class used to process the data. If provided, will be used to automatically process the inputs
             for the model, and it will be saved along the model to make it easier to rerun an interrupted training or
             reuse the fine-tuned model.
         model_init (`Callable[[], transformers.PreTrainedModel]`):
-            The model initializer to use for training. If None is specified, the default model initializer will be
-            used.
+            The model initializer to use for training. If None is specified, the default model initializer will be used.
         callbacks (`list[transformers.TrainerCallback]`):
             The callbacks to use for training.
         optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`):
@@ -1466,11 +1418,10 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
         preprocess_logits_for_metrics (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`):
             The function to use to preprocess the logits before computing the metrics.
         peft_config (`dict`, defaults to `None`):
-            The PEFT configuration to use for training. If you pass a PEFT configuration, the model will be wrapped in
-            a PEFT model.
+            The PEFT configuration to use for training. If you pass a PEFT configuration, the model will be wrapped in a PEFT model.
         compute_metrics (`Callable[[EvalPrediction], dict]`, *optional*):
-            The function to use to compute the metrics. Must take a `EvalPrediction` and return a dictionary string to
-            metric values.
+            The function to use to compute the metrics. Must take a `EvalPrediction` and return
+            a dictionary string to metric values.
     
     """
     def __init__(
@@ -1490,26 +1441,15 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
     ):
         if args is None: args = UnslothCPOConfig()
         use_bf16 = getattr(args, 'bf16', False)
-        if type(use_bf16) is not bool: use_bf16 = False
         use_fp16 = getattr(args, 'fp16', False)
-        if type(use_fp16) is not bool: use_fp16 = False
-        force_float32 = False
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1':
-            print('Unsloth: Switching to float32 training since model cannot work with float16')
-            force_float32 = True
-        mixed_precision_dtype = os.environ.get('UNSLOTH_MIXED_PRECISION', 'float32')
         dtype = getattr(model.config, 'torch_dtype', None)
         if dtype is None: dtype = model.get_input_embeddings().dtype
         from unsloth_zoo.utils import _get_dtype
         dtype = _get_dtype(dtype)
         float16 = dtype == torch.float16
-        if not force_float32 and (float16 and use_bf16): raise TypeError('Unsloth: Model is in float16 precision but you want to use bfloat16 precision. Set fp16 to `True` and bf16 to `False`')
-        if not force_float32 and (not float16 and use_fp16): raise TypeError('Unsloth: Model is in bfloat16 precision but you want to use float16 precision. Set fp16 to `False` and bf16 to `True`')
-        if force_float32:
-            args.fp16 = False
-            args.bf16 = False
-            os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'
-        elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32':
+        if float16 and use_bf16: raise TypeError('Unsloth: Model is in float16 precision but you want to use bfloat16 precision. Set fp16 to `True` and bf16 to `False`')
+        if not float16 and use_fp16: raise TypeError('Unsloth: Model is in bfloat16 precision but you want to use float16 precision. Set fp16 to `False` and bf16 to `True`')
+        if not use_bf16 and not use_fp16:
             args.fp16 = float16
             args.bf16 = not float16
             os.environ['ACCELERATE_MIXED_PRECISION'] = 'fp16' if float16 else 'bf16'
@@ -1527,25 +1467,10 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
             if eval_bsz == 8 and args.per_device_train_batch_size < eval_bsz: args.per_device_eval_batch_size = args.per_device_train_batch_size
             if getattr(args, 'eval_accumulation_steps', None) is None and ga_steps is not None: args.eval_accumulation_steps = ga_steps
         fp16_full_eval = getattr(args, 'fp16_full_eval', False)
-        if type(fp16_full_eval) is not bool: fp16_full_eval = False
         bf16_full_eval = getattr(args, 'bf16_full_eval', False)
-        if type(bf16_full_eval) is not bool: bf16_full_eval = False
         if args.fp16 and bf16_full_eval: args.bf16_full_eval = False; args.fp16_full_eval = True
         if args.bf16 and fp16_full_eval: args.bf16_full_eval = True; args.fp16_full_eval = False
-        if force_float32:
-            args.bf16_full_eval = False
-            args.fp16_full_eval = False
-        elif os.environ.get('UNSLOTH_MIXED_PRECISION', 'float32') == 'bfloat16':
-            args.bf16_full_eval = True
-            args.fp16_full_eval = False
-        elif not bf16_full_eval and not fp16_full_eval:
-            args.bf16_full_eval = args.bf16
-            args.fp16_full_eval = args.fp16
-        _output_logits = False
-        if locals().get('compute_metrics', None) is not None: _output_logits = True
-        if locals().get('preprocess_logits_for_metrics', None) is not None: _output_logits = True
-        if _output_logits:
-            os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
+        if not bf16_full_eval and not fp16_full_eval: args.bf16_full_eval = args.bf16; args.fp16_full_eval = args.fp16
         if 'max_seq_length' not in locals() and not hasattr(args, 'max_seq_length'):
             pass
         else:
@@ -1560,23 +1485,6 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
         if 'processing_class' in locals():
             if hasattr(processing_class, 'padding_side'): processing_class.padding_side = 'right'
             if hasattr(processing_class, 'tokenizer') and hasattr(processing_class.tokenizer, 'padding_side'): processing_class.tokenizer.padding_side = 'right'
-        __tokenizer = processing_class if 'processing_class' in locals() else tokenizer
-        from unsloth_zoo.vision_utils import UnslothVisionDataCollator
-        if not isinstance(data_collator, UnslothVisionDataCollator):
-            if isinstance(data_collator, DataCollatorForSeq2Seq) and 'labels' not in train_dataset.column_names:
-                data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer, mlm = False, mlm_probability = 0.0)
-            elif isinstance(data_collator, TransformersDataCollatorForLanguageModeling) and 'labels' in train_dataset.column_names:
-                data_collator = DataCollatorForSeq2Seq(__tokenizer)
-        else:
-            if hasattr(args, 'remove_unused_columns'): args.remove_unused_columns = False
-            if hasattr(args, 'dataset_text_field'): args.dataset_text_field = ''
-            if hasattr(args, 'dataset_kwargs'): args.dataset_kwargs = {'skip_prepare_dataset': True}
-        if not isinstance(data_collator, UnslothVisionDataCollator):
-            if not hasattr(__tokenizer, 'pad') and hasattr(__tokenizer, 'tokenizer'):
-                if isinstance(data_collator, DataCollatorForSeq2Seq):
-                    data_collator = DataCollatorForSeq2Seq(__tokenizer.tokenizer)
-                else:
-                    data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer.tokenizer, mlm = False, mlm_probability = 0.0)
         other_metrics = []
         
         from unsloth_zoo.logging_utils import PatchRLStatistics
@@ -1599,14 +1507,6 @@ class UnslothCPOTrainer(_UnslothCPOTrainer):
             if hasattr(self, 'neftune_hook_handle'): del self.neftune_hook_handle
         if getattr(args, 'neftune_noise_alpha', None) is not None:
             model.get_input_embeddings().neftune_noise_alpha = self.neftune_noise_alpha
-        pass
-        if hasattr(self, 'accelerator'):
-            scaler = self.accelerator.scaler
-            current_model = model
-            while hasattr(current_model, 'model'):
-                current_model.accelerator_scaler = scaler
-                current_model = current_model.model
-            current_model.accelerator_scaler = scaler
         pass
         
 pass

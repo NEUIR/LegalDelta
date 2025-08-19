@@ -1,16 +1,15 @@
 """
-2025.8.4
-2025.8.5
+2025.3.2
+2025.3.4
 4.55.2
-0.21.0
+0.15.2
 __UNSLOTH_VERSIONING__
 """
 from torch import Tensor
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.ddpo_trainer import (Accelerator, Any, Callable, DDPOConfig, DDPOStableDiffusionPipeline, DDPOTrainer, Optional, Path, PerPromptStatTracker, ProjectConfiguration, PyTorchModelHubMixin, Union, defaultdict, futures, generate_model_card, get_comet_experiment_url, is_wandb_available, logger, os, set_seed, textwrap, torch, wandb, warnings)
+from trl.trainer.ddpo_trainer import (Accelerator, Any, Callable, DDPOConfig, DDPOStableDiffusionPipeline, DDPOTrainer, Optional, PerPromptStatTracker, ProjectConfiguration, PyTorchModelHubMixin, Union, defaultdict, futures, generate_model_card, get_comet_experiment_url, is_wandb_available, logger, os, set_seed, textwrap, torch, warn)
 
 
 import os
@@ -21,8 +20,6 @@ import torch
 import numpy as np
 from contextlib import nullcontext
 from torch.nn import functional as F
-from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling as TransformersDataCollatorForLanguageModeling
-
 torch_compile_options = {
     "epilogue_fusion"   : True,
     "max_autotune"      : False,
@@ -32,22 +29,14 @@ torch_compile_options = {
 }
 
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def chunked_selective_log_softmax(logits, index):
-    # Split into 4 chunks only
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = 4, dim = 0)
-    all_per_token_logps = []
-    # Below loop does the same as selective_log_softmax(chunk_logits, chunk_index)
-    for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
-        chunk_logits = chunk_logits.to(torch.float32)
-        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
-        per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
-    pass
-    all_per_token_logps = torch.concat(all_per_token_logps)
-    all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
-    return all_per_token_logps
+def selective_log_softmax(logits, index):
+    logits = logits.to(torch.float32)
+    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+    # loop to reduce peak mem consumption
+    # logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+    logsumexp_values = torch.logsumexp(logits, dim = -1)
+    per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    return per_token_logps
 @dataclass
 class UnslothDDPOConfig(DDPOConfig):
     """
@@ -253,12 +242,8 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
         sd_pipeline: DDPOStableDiffusionPipeline,
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
     ):
-        warnings.warn(
-            "DDPOTrainer is deprecated and will be removed in version 0.23.0.",
-            DeprecationWarning,
-        )
         if image_samples_hook is None:
-            warnings.warn("No image_samples_hook provided; no images will be logged")
+            warn("No image_samples_hook provided; no images will be logged")
 
         self.prompt_fn = prompt_function
         self.reward_fn = reward_function
@@ -328,7 +313,7 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
             dynamic_ncols=True,
         )
 
-        # For mixed precision training we cast all non-trainable weights [vae, non-lora text_encoder and non-lora unet] to half-precision
+        # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
         if self.accelerator.mixed_precision == "fp16":
             inference_dtype = torch.float16
@@ -422,8 +407,7 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
         Side Effects:
             - Model weights are updated
             - Logs the statistics to the accelerator trackers.
-            - If `self.image_samples_callback` is not None, it will be called with the prompt_image_pairs, global_step,
-              and the accelerator tracker.
+            - If `self.image_samples_callback` is not None, it will be called with the prompt_image_pairs, global_step, and the accelerator tracker.
 
         Returns:
             global_step (int): The updated global step.
@@ -528,18 +512,18 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
             timesteps (torch.Tensor):
                 The timesteps sampled from the diffusion model, shape: [batch_size]
             next_latents (torch.Tensor):
-                The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height,
-                width]
+                The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
             log_probs (torch.Tensor):
                 The log probabilities of the latents, shape: [batch_size]
             advantages (torch.Tensor):
                 The advantages of the latents, shape: [batch_size]
             embeds (torch.Tensor):
-                The embeddings of the prompts, shape: [2*batch_size or batch_size, ...] Note: the "or" is because if
-                train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+                The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+                Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
 
         Returns:
-            loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor) (all of these are of shape (1,))
+            loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+            (all of these are of shape (1,))
         """
         with self.autocast():
             if self.config.train_cfg:
@@ -788,15 +772,6 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
         self.sd_pipeline.save_pretrained(save_directory)
         self.create_model_card()
 
-    # Ensure the model card is saved along with the checkpoint
-    def _save_checkpoint(self, model, trial):
-        if self.args.hub_model_id is None:
-            model_name = Path(self.args.output_dir).name
-        else:
-            model_name = self.args.hub_model_id.split("/")[-1]
-        self.create_model_card(model_name=model_name)
-        super()._save_checkpoint(model, trial)
-
     def create_model_card(
         self,
         model_name: Optional[str] = None,
@@ -822,18 +797,12 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
         else:
             base_model = None
 
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
 
         if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        tags.update(self._tag_names)
+            tags.append("unsloth")
 
         citation = textwrap.dedent("""\
         @inproceedings{black2024training,
@@ -851,7 +820,7 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
+            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="DDPO",
             trainer_citation=citation,
@@ -863,14 +832,14 @@ class _UnslothDDPOTrainer(PyTorchModelHubMixin):
 class UnslothDDPOTrainer(_UnslothDDPOTrainer):
     """
     
-    The DDPOTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models. Note, this trainer is heavily
-    inspired by the work here: https://github.com/kvablack/ddpo-pytorch As of now only Stable Diffusion based pipelines
-    are supported
+    The DDPOTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
+    Note, this trainer is heavily inspired by the work here: https://github.com/kvablack/ddpo-pytorch
+    As of now only Stable Diffusion based pipelines are supported
 
     Attributes:
-        **config** (`DDPOConfig`) -- Configuration object for DDPOTrainer. Check the documentation of `PPOConfig` for more:
+        **config** (`DDPOConfig`) -- Configuration object for DDPOTrainer. Check the documentation of `PPOConfig` for more
          details.
-        **reward_function** (Callable[[torch.Tensor, tuple[str], tuple[Any]], torch.Tensor]) -- Reward function to be used:
+        **reward_function** (Callable[[torch.Tensor, tuple[str], tuple[Any]], torch.Tensor]) -- Reward function to be used
         **prompt_function** (Callable[[], tuple[str, Any]]) -- Function to generate prompts to guide model
         **sd_pipeline** (`DDPOStableDiffusionPipeline`) -- Stable Diffusion pipeline to be used for training.
         **image_samples_hook** (Optional[Callable[[Any, Any, Any], Any]]) -- Hook to be called to log images

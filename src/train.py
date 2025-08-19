@@ -1,6 +1,7 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 os.environ["UNSLOTH_COMPILE_OVERWRITE"] = "0"
+os.environ["UNSLOTH_CACHE_DIR"] = "path/to/yours/Legal_Delta/scripts/unsloth_compiled_cache"
 import torch._dynamo
 import torch
 import re
