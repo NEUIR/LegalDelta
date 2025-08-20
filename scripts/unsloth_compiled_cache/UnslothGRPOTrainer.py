@@ -79,9 +79,17 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1):
         def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling):
-            new_logits = torch.matmul(new_hidden_states, lm_head.t())
+            if new_hidden_states.shape[-1] == 152064:
+                new_logits = new_hidden_states
+                old_logits = old_hidden_states
+            elif new_hidden_states.shape[-1] == 3584:
+                new_logits = torch.matmul(new_hidden_states, lm_head.t())
+                old_logits = torch.matmul(old_hidden_states, lm_head.t())
+            else:
+                raise ValueError(f"Unexpected dimension: {new_hidden_states.shape[-1]}")
+            # new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-            old_logits = torch.matmul(old_hidden_states, lm_head.t())
+            # old_logits = torch.matmul(old_hidden_states, lm_head.t())
             old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             loss, completion_length, mean_kl = grpo_compute_loss(
                 old_logits, new_logits, input_ids, mask, beta, advantages,
