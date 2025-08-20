@@ -5,9 +5,10 @@ Recent versions of Unsloth use an encapsulated vLLM backend that prevents direct
 ## Modified Packages
 
 The following files have been modified:
-- **`trl/trainer/grpo_trainer.py`**: Updated trainer to support hybrid model access
-- **`unsloth_zoo/compiler.py`**: Enhanced model compilation for dual access patterns  
-- **`unsloth_zoo/rl_replacements.py`**: Modified RL components for compatibility
+- **`site-packages/trl/trainer/grpo_trainer.py`**: Updated trainer to support hybrid model access
+- **`site-packages/unsloth_zoo/compiler.py`**: Enhanced model compilation for dual access patterns  
+- **`site-packages/unsloth_zoo/rl_replacements.py`**: Modified RL components for compatibility
+- **`site-packages/unsloth/rl.py`**: Only patching GRPO trainer as requested
 
 ## Important Configuration
 
