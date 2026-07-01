@@ -40,6 +40,21 @@ conda activate legal_delta
 pip install -r requirements.txt --force-reinstall --no-deps --no-cache-dir
 ```
 
+## Dataset
+
+The reasoning-enhanced dataset used in this work is available on Hugging Face:
+
+https://huggingface.co/datasets/Xubqpanda/LegalDelta
+
+You can load it with:
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("Xubqpanda/LegalDelta")
+```
+
+
 ## Using Legal&Delta; model
 **(1) Use `git clone` to download the model:**
 ❗️Note: These are lora checkpoints of legal models, please merge it before use.
